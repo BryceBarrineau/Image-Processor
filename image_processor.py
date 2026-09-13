@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSplitter,
     QDialog, QVBoxLayout, QDialogButtonBox, QFileDialog, QMessageBox,
-    QScrollArea, QFrame, QStatusBar, QProgressBar, QShortcut
+    QScrollArea, QFrame, QStatusBar, QProgressBar, QShortcut, QComboBox
 )
 from PyQt5.QtCore import Qt, QTimer, QMimeData, pyqtSignal, QSize
 from PyQt5.QtGui import (
@@ -126,6 +126,22 @@ class ProcessingState:
             if self.images[i].status == "pending":
                 return i
         return -1  # No pending images
+    
+    def get_next_pending_index_in_class(self, class_name: str, start: int = 0) -> int:
+        """Find the next pending image in a specific class."""
+        for i in range(start, len(self.images)):
+            if self.images[i].class_name == class_name and self.images[i].status == "pending":
+                return i
+        for i in range(0, start):
+            if self.images[i].class_name == class_name and self.images[i].status == "pending":
+                return i
+        return -1
+    
+    def get_filtered_images(self, class_name: Optional[str] = None) -> List[ImageItem]:
+        """Get images filtered by class name."""
+        if not class_name:
+            return self.images
+        return [img for img in self.images if img.class_name == class_name]
     
     def keep_image(self) -> bool:
         """Mark current image as kept."""
@@ -273,7 +289,7 @@ class ProcessingState:
 # ============================================================================
 
 class ImageDisplay(QScrollArea):
-    """Custom scrollable image display with zoom capability."""
+    """Custom scrollable image display with zoom capability and mouse-position zoom."""
     
     double_clicked = pyqtSignal()
     
@@ -283,6 +299,7 @@ class ImageDisplay(QScrollArea):
         self.min_zoom = 0.1
         self.max_zoom = 10.0
         self.current_pixmap: Optional[QPixmap] = None
+        self.mouse_pos = None  # Track mouse position for zooming
         
         self.setWidgetResizable(True)
         self.setAlignment(Qt.AlignCenter)
@@ -291,6 +308,8 @@ class ImageDisplay(QScrollArea):
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: #1e1e1e;")
+        self.image_label.setMouseTracking(True)
+        self.image_label.mouseMoveEvent = self._on_mouse_move
         self.setWidget(self.image_label)
         
         self.setStyleSheet("""
@@ -373,13 +392,45 @@ class ImageDisplay(QScrollArea):
     def wheelEvent(self, event: QWheelEvent):
         """Handle mouse wheel for zooming."""
         if event.modifiers() == Qt.ControlModifier:
-            if event.angleDelta().y() > 0:
-                self.zoom_in()
-            else:
-                self.zoom_out()
+            # Zoom toward mouse position
+            zoom_delta = 1.25 if event.angleDelta().y() > 0 else 0.8
+            self._zoom_at_mouse(zoom_delta)
             event.accept()
         else:
             super().wheelEvent(event)
+    
+    def _zoom_at_mouse(self, zoom_factor: float):
+        """Zoom toward current mouse position."""
+        if not self.current_pixmap or not self.mouse_pos:
+            return
+        
+        # Calculate the ratio of mouse position to image size
+        current_scaled_size = self.current_pixmap.size() * self.zoom_factor
+        if current_scaled_size.width() == 0 or current_scaled_size.height() == 0:
+            return
+        
+        old_ratio_x = self.horizontalScrollBar().value() / max(1, current_scaled_size.width() - self.viewport().width())
+        old_ratio_y = self.verticalScrollBar().value() / max(1, current_scaled_size.height() - self.viewport().height())
+        
+        # Apply zoom
+        self.zoom_factor = min(max(self.zoom_factor * zoom_factor, self.min_zoom), self.max_zoom)
+        
+        # Update display
+        self._update_display()
+        
+        # Adjust scrollbars to maintain zoom center
+        new_scaled_size = self.current_pixmap.size() * self.zoom_factor
+        if new_scaled_size.width() > self.viewport().width():
+            new_x = int(old_ratio_x * (new_scaled_size.width() - self.viewport().width()))
+            self.horizontalScrollBar().setValue(new_x)
+        else:
+            self.horizontalScrollBar().setValue(0)
+            
+        if new_scaled_size.height() > self.viewport().height():
+            new_y = int(old_ratio_y * (new_scaled_size.height() - self.viewport().height()))
+            self.verticalScrollBar().setValue(new_y)
+        else:
+            self.verticalScrollBar().setValue(0)
     
     def mouseDoubleClickEvent(self, event):
         """Handle double click to fit to view."""
@@ -582,6 +633,7 @@ class ImageProcessorWindow(QMainWindow):
         
         self.state = ProcessingState()
         self.session_file = Path("image_processor_session.json")
+        self.current_filter_class = None  # None means "All Classes"
         
         self._setup_ui()
         self._setup_shortcuts()
@@ -719,16 +771,62 @@ class ImageProcessorWindow(QMainWindow):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(5)
         
-        # Image info bar
+        # Class filter and info bar (prominent class display)
+        self.class_filter_combo = QComboBox()
+        self.class_filter_combo.setStyleSheet("""
+            QComboBox {
+                padding: 8px 12px;
+                font-size: 14px;
+                background-color: #333;
+                color: white;
+                border: 1px solid #555;
+                border-radius: 5px;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #888;
+            }
+        """)
+        self.class_filter_combo.addItem("All Classes")
+        self.class_filter_combo.currentIndexChanged.connect(self._on_class_filter_changed)
+        
+        # Class badge (large, prominent display)
+        self.class_badge = QLabel("NO CLASS")
+        self.class_badge.setStyleSheet("""
+            QLabel {
+                background-color: #0078d4;
+                color: white;
+                font-size: 18px;
+                font-weight: bold;
+                padding: 10px 20px;
+                border-radius: 8px;
+                min-width: 120px;
+            }
+        """)
+        self.class_badge.setAlignment(Qt.AlignCenter)
+        
+        # Image info label (smaller, below class)
         self.info_label = QLabel("No image loaded")
         self.info_label.setStyleSheet("""
-            color: #ccc;
-            font-size: 13px;
-            padding: 8px;
-            background-color: #2d2d2d;
+            color: #aaa;
+            font-size: 12px;
+            padding: 6px;
+            background-color: #252525;
             border-radius: 3px;
         """)
-        center_layout.addWidget(self.info_label)
+        
+        # Top bar with filter and class display
+        top_bar = QHBoxLayout()
+        top_bar.addWidget(self.class_filter_combo)
+        top_bar.addWidget(self.class_badge)
+        top_bar.addWidget(self.info_label)
+        top_bar.setSpacing(10)
+        center_layout.addLayout(top_bar)
         
         # Image display
         self.image_display = ImageDisplay()
@@ -863,6 +961,15 @@ class ImageProcessorWindow(QMainWindow):
             self.status_bar.showMessage("No images found")
             return
         
+        # Populate class filter dropdown
+        self.class_filter_combo.blockSignals(True)
+        self.class_filter_combo.clear()
+        self.class_filter_combo.addItem("All Classes")
+        for cls in sorted(self.state.classes):
+            self.class_filter_combo.addItem(cls)
+        self.class_filter_combo.blockSignals(False)
+        self.current_filter_class = None
+        
         self._update_ui()
         self._display_current_image()
         self.apply_btn.setEnabled(True)
@@ -877,16 +984,28 @@ class ImageProcessorWindow(QMainWindow):
         self._update_nav_buttons()
     
     def _update_stats(self):
-        """Update statistics display."""
+        """Update statistics display (respecting class filter)."""
         self.state.update_stats()
-        total = len(self.state.images)
-        pending = self.state.stats.get("pending", 0)
-        kept = self.state.stats.get("kept", 0)
-        deleted = self.state.stats.get("deleted", 0)
-        moved = self.state.stats.get("moved", 0)
+        
+        # Get filtered images for stats display
+        if self.current_filter_class:
+            filtered_imgs = [img for img in self.state.images if img.class_name == self.current_filter_class]
+            total = len(filtered_imgs)
+            pending = sum(1 for img in filtered_imgs if img.status == "pending")
+            kept = sum(1 for img in filtered_imgs if img.status == "kept")
+            deleted = sum(1 for img in filtered_imgs if img.status == "deleted")
+            moved = sum(1 for img in filtered_imgs if img.status == "moved")
+            filter_suffix = f" ({self.current_filter_class})"
+        else:
+            total = len(self.state.images)
+            pending = self.state.stats.get("pending", 0)
+            kept = self.state.stats.get("kept", 0)
+            deleted = self.state.stats.get("deleted", 0)
+            moved = self.state.stats.get("moved", 0)
+            filter_suffix = " (All)"
         
         self.stats_label.setText(
-            f"Statistics:\n"
+            f"Statistics{filter_suffix}:\n"
             f"Pending: {pending}\n"
             f"Kept: {kept}\n"
             f"Deleted: {deleted}\n"
@@ -899,6 +1018,7 @@ class ImageProcessorWindow(QMainWindow):
             self.progress_bar.setValue(processed)
             self.progress_bar.setFormat(f"{processed}/{total} ({processed*100//total}%)")
         
+        self._update_class_badge()
         self.info_label.setText(self._get_info_text())
     
     def _get_info_text(self) -> str:
@@ -931,20 +1051,38 @@ class ImageProcessorWindow(QMainWindow):
             self.info_label.setText("No image loaded")
     
     def _previous_image(self):
-        """Go to previous image."""
+        """Go to previous image (respecting class filter)."""
         if len(self.state.images) == 0:
             return
         
-        self.state.current_index = (self.state.current_index - 1) % len(self.state.images)
+        if not self.current_filter_class:
+            # All classes - cycle through all
+            self.state.current_index = (self.state.current_index - 1) % len(self.state.images)
+        else:
+            # Filtered - cycle through only this class's images
+            class_images = [i for i, img in enumerate(self.state.images) if img.class_name == self.current_filter_class]
+            if class_images:
+                current_pos = class_images.index(self.state.current_index) if self.state.current_index in class_images else 0
+                self.state.current_index = class_images[(current_pos - 1) % len(class_images)]
+        
         self._display_current_image()
         self._update_stats()
     
     def _next_image(self):
-        """Go to next image."""
+        """Go to next image (respecting class filter)."""
         if len(self.state.images) == 0:
             return
         
-        self.state.current_index = (self.state.current_index + 1) % len(self.state.images)
+        if not self.current_filter_class:
+            # All classes - cycle through all
+            self.state.current_index = (self.state.current_index + 1) % len(self.state.images)
+        else:
+            # Filtered - cycle through only this class's images
+            class_images = [i for i, img in enumerate(self.state.images) if img.class_name == self.current_filter_class]
+            if class_images:
+                current_pos = class_images.index(self.state.current_index) if self.state.current_index in class_images else 0
+                self.state.current_index = class_images[(current_pos + 1) % len(class_images)]
+        
         self._display_current_image()
         self._update_stats()
     

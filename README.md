@@ -43,17 +43,33 @@ pip install -r requirements.txt
 
 4. Use keyboard shortcuts to review images
 
+## Features in Detail
+
+### Class Filtering
+- **Dropdown menu** at the top lets you filter by class
+- Select "All Classes" to see all images, or pick a specific class
+- Navigation (A/D) respects the current filter - cycles only through selected class
+- Statistics and progress bar update to show filtered results
+- **Prominent class badge** displays the current image's class with color coding
+
+### Mouse-Position Zooming
+- **Ctrl + Scroll wheel** to zoom
+- Zooming focuses on where your mouse cursor is positioned
+- Smooth scroll-to-zoom experience for detailed inspection
+- Double-click the image to fit it to the view
+
 ## Keyboard Shortcuts
 
 | Key | Action |
 |-----|--------|
-| `A` or `←` | Previous image |
-| `D` or `→` | Next image |
+| `A` or `←` | Previous image (respects class filter) |
+| `D` or `→` | Next image (respects class filter) |
 | `Enter` | Keep image (copy to same class in output) |
 | `X` | Delete image (skip, don't copy to output) |
 | `C` | Change class (opens popup to select new class) |
 | `Ctrl+Z` | Undo last action |
 | `F` | Fit image to view |
+| `Ctrl + Scroll` | Zoom in/out (toward mouse position) |
 | `+` / `-` | Zoom in / out |
 | `0` | Reset zoom to 100% |
 | `Ctrl+S` | Save session |
