@@ -309,7 +309,6 @@ class ImageDisplay(QScrollArea):
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("background-color: #1e1e1e;")
         self.image_label.setMouseTracking(True)
-        self.image_label.mouseMoveEvent = self._on_mouse_move
         self.setWidget(self.image_label)
         
         self.setStyleSheet("""
@@ -318,6 +317,15 @@ class ImageDisplay(QScrollArea):
                 background-color: #1e1e1e;
             }
         """)
+    
+    def _on_mouse_move(self, event):
+        """Track mouse position for zooming."""
+        self.mouse_pos = event.pos()
+    
+    def mouseMoveEvent(self, event):
+        """Override to track mouse position."""
+        self.mouse_pos = self.mapFromGlobal(event.globalPos())
+        super().mouseMoveEvent(event)
         
     def load_image(self, path: Path) -> bool:
         """Load an image from file."""
@@ -977,6 +985,74 @@ class ImageProcessorWindow(QMainWindow):
         self.status_bar.showMessage(
             f"Loaded {len(self.state.images)} images from {len(self.state.classes)} classes"
         )
+    
+    def _on_class_filter_changed(self, index: int):
+        """Handle class filter change - update view to show only selected class images."""
+        if index == 0:
+            self.current_filter_class = None  # All classes
+        else:
+            self.current_filter_class = self.class_filter_combo.itemText(index)
+        
+        # Find first pending image in the filtered set
+        self._go_to_first_pending()
+        self._update_stats()
+        self._display_current_image()
+    
+    def _go_to_first_pending(self):
+        """Navigate to first pending image in the current filter."""
+        if not self.state.images:
+            return
+        
+        if not self.current_filter_class:
+            # Show all classes - find first pending from current position
+            next_idx = self.state.get_next_pending_index(self.state.current_index + 1)
+            if next_idx >= 0:
+                self.state.current_index = next_idx
+        else:
+            # Filtered by class - find first pending of this class
+            for i in range(len(self.state.images)):
+                img = self.state.images[i]
+                if img.class_name == self.current_filter_class and img.status == "pending":
+                    self.state.current_index = i
+                    break
+            else:
+                # No pending images in this class - stay at current or go to first
+                if self.state.current_index >= len(self.state.images):
+                    self.state.current_index = 0
+    
+    def _update_class_badge(self):
+        """Update the prominent class badge display."""
+        img = self.state.get_current_image()
+        if img:
+            self.class_badge.setText(f"📁 {img.class_name}")
+            # Color code based on class index for visual distinction
+            class_idx = self.state.classes.index(img.class_name) if img.class_name in self.state.classes else 0
+            colors = ["#0078d4", "#2d8a3e", "#c4314b", "#986f0b", "#7a3b9e", "#008272"]
+            color = colors[class_idx % len(colors)]
+            self.class_badge.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {color};
+                    color: white;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    min-width: 120px;
+                }}
+            """)
+        else:
+            self.class_badge.setText("NO CLASS")
+            self.class_badge.setStyleSheet("""
+                QLabel {
+                    background-color: #666;
+                    color: white;
+                    font-size: 18px;
+                    font-weight: bold;
+                    padding: 10px 20px;
+                    border-radius: 8px;
+                    min-width: 120px;
+                }
+            """)
     
     def _update_ui(self):
         """Update all UI elements based on current state."""
