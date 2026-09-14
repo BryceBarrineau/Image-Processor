@@ -16,13 +16,14 @@ from collections import defaultdict
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QSplitter,
-    QDialog, QVBoxLayout, QDialogButtonBox, QFileDialog, QMessageBox,
-    QScrollArea, QFrame, QStatusBar, QProgressBar, QShortcut, QComboBox
+    QDialog, QDialogButtonBox, QFileDialog, QMessageBox,
+    QScrollArea, QFrame, QStatusBar, QProgressBar, QShortcut, QComboBox,
+    QLineEdit, QInputDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QMimeData, pyqtSignal, QSize
 from PyQt5.QtGui import (
     QPixmap, QImage, QKeySequence, QWheelEvent, QDragEnterEvent,
-    QDropEvent, QFont, QColor, QPalette
+    QDropEvent, QFont, QColor, QPalette, QPainter
 )
 from PIL import Image
 
@@ -35,7 +36,8 @@ class ImageItem:
     """Represents a single image in the processing queue."""
     
     def __init__(self, path: Path, class_name: str):
-        self.path = path
+        self.path = path  # current location (may change as files are moved)
+        self.original_path = path  # where the file started (for undo)
         self.class_name = class_name
         self.status = "pending"  # pending, kept, deleted, moved
         self.original_class = class_name
@@ -143,52 +145,156 @@ class ProcessingState:
             return self.images
         return [img for img in self.images if img.class_name == class_name]
     
+    def get_class_stats(self, class_name: Optional[str] = None) -> Dict[str, int]:
+        """Get statistics for a class. class_name None = all classes."""
+        stats = {"kept": 0, "deleted": 0, "moved": 0, "pending": 0}
+        for img in self.images:
+            if class_name is None or img.class_name == class_name:
+                if img.status in stats:
+                    stats[img.status] += 1
+        return stats
+    
+    def add_class(self, class_name: str) -> bool:
+        """Create a new class folder. Returns True on success."""
+        if not class_name or class_name in self.classes or not self.source_root:
+            return False
+        try:
+            (self.source_root / class_name).mkdir()
+        except OSError:
+            return False
+        self.classes.append(class_name)
+        return True
+    
+    def rename_class(self, old_name: str, new_name: str) -> bool:
+        """Rename a class folder and update all references. Returns True on success."""
+        if old_name not in self.classes or new_name in self.classes or not self.source_root:
+            return False
+        old_dir = self.source_root / old_name
+        new_dir = self.source_root / new_name
+        try:
+            old_dir.rename(new_dir)
+        except OSError:
+            return False
+        self.classes[self.classes.index(old_name)] = new_name
+        for img in self.images:
+            if img.class_name == old_name:
+                img.class_name = new_name
+                img.path = new_dir / img.path.name
+            if img.original_class == old_name:
+                img.original_class = new_name
+            if img.moved_to == old_name:
+                img.moved_to = new_name
+        return True
+    
     def keep_image(self) -> bool:
-        """Mark current image as kept."""
+        """Keep current image: move it into processed_output/<class>."""
         img = self.get_current_image()
-        if img and img.status == "pending":
-            img.status = "kept"
-            self.undo_stack.append((img, self.current_index, "pending"))
-            self.history.append(HistoryEntry(img.path.name, "keep", img.class_name))
-            self.update_stats()
-            return True
-        return False
+        if not img or img.status != "pending":
+            return False
+        if not self.output_root:
+            return False
+        dest_dir = self.output_root / img.class_name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._safe_dest(dest_dir, img.path.name)
+        if not self._move_file(img, dest):
+            return False
+        img.status = "kept"
+        self.undo_stack.append((img, self.current_index, "pending"))
+        self.history.append(HistoryEntry(img.path.name, "keep", img.class_name))
+        self.update_stats()
+        return True
     
     def delete_image(self) -> bool:
-        """Mark current image for deletion."""
+        """Delete current image: move it into processed_output/_deleted (recoverable)."""
         img = self.get_current_image()
-        if img and img.status == "pending":
-            img.status = "deleted"
-            self.undo_stack.append((img, self.current_index, "pending"))
-            self.history.append(HistoryEntry(img.path.name, "delete", img.class_name))
-            self.update_stats()
-            return True
-        return False
+        if not img or img.status != "pending":
+            return False
+        if not self.output_root:
+            return False
+        dest_dir = self.output_root / "_deleted"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._safe_dest(dest_dir, img.path.name)
+        if not self._move_file(img, dest):
+            return False
+        img.status = "deleted"
+        self.undo_stack.append((img, self.current_index, "pending"))
+        self.history.append(HistoryEntry(img.path.name, "delete", img.class_name))
+        self.update_stats()
+        return True
     
     def move_image(self, target_class: str) -> bool:
-        """Mark current image to be moved to another class."""
+        """Move current image to another class in processed_output/<target>."""
         img = self.get_current_image()
-        if img and img.status == "pending" and target_class != img.class_name:
-            img.status = "moved"
-            img.moved_to = target_class
-            self.undo_stack.append((img, self.current_index, "pending"))
-            self.history.append(HistoryEntry(img.path.name, "move", img.class_name, target_class))
-            self.update_stats()
+        if not img or img.status != "pending" or target_class == img.class_name:
+            return False
+        if target_class not in self.classes:
+            return False
+        if not self.output_root:
+            return False
+        dest_dir = self.output_root / target_class
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = self._safe_dest(dest_dir, img.path.name)
+        if not self._move_file(img, dest):
+            return False
+        img.status = "moved"
+        img.moved_to = target_class
+        self.undo_stack.append((img, self.current_index, "pending"))
+        self.history.append(HistoryEntry(img.path.name, "move", img.class_name, target_class))
+        self.update_stats()
+        return True
+    
+    # ------------------------------------------------------------- file mgmt
+    def _safe_dest(self, dest_dir: Path, filename: str) -> Path:
+        """Return a destination path, appending a number if it already exists."""
+        dest = dest_dir / filename
+        stem = dest.stem
+        suffix = dest.suffix
+        counter = 1
+        while dest.exists():
+            dest = dest_dir / f"{stem}_{counter}{suffix}"
+            counter += 1
+        return dest
+    
+    def _move_file(self, img: ImageItem, dest: Path) -> bool:
+        """Move the file backing an image to dest, updating its path. Safe if missing."""
+        if not img.path.exists():
+            # File already gone (e.g. user deleted it) - treat as already moved
+            img.path = dest
             return True
-        return False
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(img.path), str(dest))
+            img.path = dest
+            return True
+        except OSError as e:
+            print(f"File move error: {e}")
+            return False
     
     def undo_last(self) -> bool:
-        """Undo the last action."""
-        if self.undo_stack:
-            img, idx, prev_status = self.undo_stack.pop()
-            img.status = prev_status
-            img.moved_to = None
-            if self.history:
-                self.history.pop()
-            self.current_index = idx
-            self.update_stats()
-            return True
-        return False
+        """Undo the last action, moving the file back to its original source folder."""
+        if not self.undo_stack:
+            return False
+        img, idx, prev_status = self.undo_stack.pop()
+        
+        # Move the file back to its pre-action location (the source class folder)
+        if img.status != "pending" and self.source_root:
+            back_dir = self.source_root / img.original_class
+            back_dir.mkdir(parents=True, exist_ok=True)
+            back = self._safe_dest(back_dir, img.path.name)
+            if img.path.exists():
+                try:
+                    shutil.move(str(img.path), str(back))
+                    img.path = back
+                except OSError as e:
+                    print(f"Undo move error: {e}")
+        
+        img.status = prev_status
+        img.moved_to = None
+        if self.history:
+            self.history.pop()
+        self.current_index = idx
+        self.update_stats()
+        return True
     
     def save_progress(self, filepath: Path):
         """Save current progress to a JSON file."""
@@ -200,6 +306,7 @@ class ProcessingState:
             "images": [
                 {
                     "path": str(img.path),
+                    "original_path": str(img.original_path),
                     "class_name": img.class_name,
                     "status": img.status,
                     "original_class": img.original_class,
@@ -235,6 +342,7 @@ class ProcessingState:
             self.images = []
             for img_data in data["images"]:
                 img = ImageItem(Path(img_data["path"]), img_data["class_name"])
+                img.original_path = Path(img_data.get("original_path", img_data["path"]))
                 img.status = img_data["status"]
                 img.original_class = img_data["original_class"]
                 img.moved_to = img_data.get("moved_to")
@@ -253,7 +361,7 @@ class ProcessingState:
             return False
     
     def apply_changes(self) -> Tuple[int, int, int]:
-        """Apply all changes and copy files to output directory. Returns (kept, deleted, moved)."""
+        """Verify final state and copy any leftovers. Moves happen immediately."""
         if not self.output_root:
             return 0, 0, 0
         
@@ -263,22 +371,29 @@ class ProcessingState:
         
         for img in self.images:
             if img.status == "kept":
-                # Copy to same class in output
-                dest_dir = self.output_root / img.class_name
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(img.path, dest_dir / img.path.name)
+                # File should already be in output; copy if still in source (idempotent)
+                if img.path.exists() and self.source_root and img.path.is_relative_to(self.source_root):
+                    dest_dir = self.output_root / img.class_name
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest = self._safe_dest(dest_dir, img.path.name)
+                    shutil.copy2(img.path, dest)
                 kept_count += 1
                 
             elif img.status == "deleted":
-                # Don't copy - mark as deleted (or actually delete if you want)
-                # For safety, we'll just not copy them to output
+                # Should already be in _deleted
+                if img.path.exists() and self.source_root and img.path.is_relative_to(self.source_root):
+                    dest_dir = self.output_root / "_deleted"
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest = self._safe_dest(dest_dir, img.path.name)
+                    shutil.copy2(img.path, dest)
                 deleted_count += 1
                 
             elif img.status == "moved" and img.moved_to:
-                # Copy to new class in output
-                dest_dir = self.output_root / img.moved_to
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(img.path, dest_dir / img.path.name)
+                if img.path.exists() and self.source_root and img.path.is_relative_to(self.source_root):
+                    dest_dir = self.output_root / img.moved_to
+                    dest_dir.mkdir(parents=True, exist_ok=True)
+                    dest = self._safe_dest(dest_dir, img.path.name)
+                    shutil.copy2(img.path, dest)
                 moved_count += 1
         
         return kept_count, deleted_count, moved_count
@@ -289,48 +404,75 @@ class ProcessingState:
 # ============================================================================
 
 class ImageDisplay(QScrollArea):
-    """Custom scrollable image display with zoom capability and mouse-position zoom."""
+    """Custom scrollable image display with MS Photos-like zoom behavior."""
     
     double_clicked = pyqtSignal()
     
     def __init__(self):
         super().__init__()
         self.zoom_factor = 1.0
-        self.min_zoom = 0.1
-        self.max_zoom = 10.0
+        self.min_zoom = 0.05
+        self.max_zoom = 20.0
         self.current_pixmap: Optional[QPixmap] = None
-        self.mouse_pos = None  # Track mouse position for zooming
+        self.fit_mode = True  # Start in fit-to-window mode
+        self.last_mouse_pos = None
+        self.is_panning = False
         
-        self.setWidgetResizable(True)
+        self.setWidgetResizable(False)
         self.setAlignment(Qt.AlignCenter)
         self.setBackgroundRole(QPalette.Dark)
+        self.setMouseTracking(True)
         
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setStyleSheet("background-color: #1e1e1e;")
-        self.image_label.setMouseTracking(True)
+        self.image_label.setStyleSheet("background-color: #1a1a1a;")
+        self.image_label.setScaledContents(False)
         self.setWidget(self.image_label)
         
         self.setStyleSheet("""
             QScrollArea {
-                border: 2px solid #444;
-                background-color: #1e1e1e;
+                border: none;
+                background-color: #1a1a1a;
             }
         """)
     
-    def _on_mouse_move(self, event):
-        """Track mouse position for zooming."""
-        self.mouse_pos = event.pos()
+    def mousePressEvent(self, event):
+        """Start panning with left mouse button."""
+        if event.button() == Qt.LeftButton and self.zoom_factor > self._get_fit_zoom():
+            self.is_panning = True
+            self.last_mouse_pos = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+        else:
+            super().mousePressEvent(event)
     
     def mouseMoveEvent(self, event):
-        """Override to track mouse position."""
-        self.mouse_pos = self.mapFromGlobal(event.globalPos())
+        """Pan the image when dragging."""
+        if self.is_panning and self.last_mouse_pos:
+            delta = event.pos() - self.last_mouse_pos
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self.last_mouse_pos = event.pos()
+        else:
+            # Update cursor based on zoom level
+            if self.zoom_factor > self._get_fit_zoom():
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
         super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """Stop panning."""
+        if event.button() == Qt.LeftButton:
+            self.is_panning = False
+            if self.zoom_factor > self._get_fit_zoom():
+                self.setCursor(Qt.OpenHandCursor)
+            else:
+                self.setCursor(Qt.ArrowCursor)
+        super().mouseReleaseEvent(event)
         
     def load_image(self, path: Path) -> bool:
         """Load an image from file."""
         try:
-            # Use PIL for better format support, then convert to QPixmap
             pil_image = Image.open(path)
             
             # Convert PIL image to QImage
@@ -349,8 +491,8 @@ class ImageDisplay(QScrollArea):
                                pil_image.width * 3, QImage.Format_RGB888)
             
             self.current_pixmap = QPixmap.fromImage(qimage)
-            self.zoom_factor = 1.0
-            self._update_display()
+            self.fit_mode = True
+            self.fit_to_view()
             return True
             
         except Exception as e:
@@ -359,90 +501,100 @@ class ImageDisplay(QScrollArea):
             self.current_pixmap = None
             return False
     
+    def _get_fit_zoom(self) -> float:
+        """Calculate the zoom factor to fit image in viewport."""
+        if not self.current_pixmap:
+            return 1.0
+        viewport_size = self.viewport().size()
+        img_size = self.current_pixmap.size()
+        scale_x = viewport_size.width() / img_size.width()
+        scale_y = viewport_size.height() / img_size.height()
+        return min(scale_x, scale_y)
+    
     def _update_display(self):
         """Update the displayed image with current zoom."""
         if self.current_pixmap:
+            scaled_size = self.current_pixmap.size() * self.zoom_factor
             scaled = self.current_pixmap.scaled(
-                self.current_pixmap.size() * self.zoom_factor,
+                scaled_size,
                 Qt.KeepAspectRatio,
                 Qt.SmoothTransformation
             )
             self.image_label.setPixmap(scaled)
-            self.image_label.resize(scaled.size())
+            self.image_label.resize(scaled_size)
     
     def fit_to_view(self):
-        """Fit image to the view area."""
+        """Fit image to the view area (MS Photos behavior)."""
         if self.current_pixmap:
-            viewport_size = self.viewport().size() - QSize(20, 20)
-            img_size = self.current_pixmap.size()
-            
-            # Calculate scale to fit
-            scale_x = viewport_size.width() / img_size.width()
-            scale_y = viewport_size.height() / img_size.height()
-            self.zoom_factor = min(scale_x, scale_y, 1.0)
+            self.zoom_factor = self._get_fit_zoom()
+            self.fit_mode = True
             self._update_display()
     
     def zoom_in(self):
-        """Zoom in by 25%."""
-        self.zoom_factor = min(self.zoom_factor * 1.25, self.max_zoom)
+        """Zoom in by 10% (smoother than 25%)."""
+        self.fit_mode = False
+        self.zoom_factor = min(self.zoom_factor * 1.1, self.max_zoom)
         self._update_display()
     
     def zoom_out(self):
-        """Zoom out by 25%."""
-        self.zoom_factor = max(self.zoom_factor / 1.25, self.min_zoom)
+        """Zoom out by 10%."""
+        self.fit_mode = False
+        self.zoom_factor = max(self.zoom_factor / 1.1, self.min_zoom)
         self._update_display()
     
     def reset_zoom(self):
-        """Reset zoom to 100%."""
+        """Reset to 100% zoom."""
+        self.fit_mode = False
         self.zoom_factor = 1.0
         self._update_display()
     
     def wheelEvent(self, event: QWheelEvent):
-        """Handle mouse wheel for zooming."""
-        if event.modifiers() == Qt.ControlModifier:
-            # Zoom toward mouse position
-            zoom_delta = 1.25 if event.angleDelta().y() > 0 else 0.8
-            self._zoom_at_mouse(zoom_delta)
-            event.accept()
+        """Handle mouse wheel for zooming (MS Photos-like)."""
+        if not self.current_pixmap:
+            return
+        
+        # Get mouse position relative to image
+        mouse_pos = event.pos()
+        old_zoom = self.zoom_factor
+        
+        # Zoom in/out
+        if event.angleDelta().y() > 0:
+            self.zoom_factor = min(self.zoom_factor * 1.1, self.max_zoom)
         else:
-            super().wheelEvent(event)
-    
-    def _zoom_at_mouse(self, zoom_factor: float):
-        """Zoom toward current mouse position."""
-        if not self.current_pixmap or not self.mouse_pos:
-            return
+            self.zoom_factor = max(self.zoom_factor / 1.1, self.min_zoom)
         
-        # Calculate the ratio of mouse position to image size
-        current_scaled_size = self.current_pixmap.size() * self.zoom_factor
-        if current_scaled_size.width() == 0 or current_scaled_size.height() == 0:
-            return
+        self.fit_mode = False
         
-        old_ratio_x = self.horizontalScrollBar().value() / max(1, current_scaled_size.width() - self.viewport().width())
-        old_ratio_y = self.verticalScrollBar().value() / max(1, current_scaled_size.height() - self.viewport().height())
+        # Calculate scroll adjustment to keep mouse point steady
+        zoom_ratio = self.zoom_factor / old_zoom
         
-        # Apply zoom
-        self.zoom_factor = min(max(self.zoom_factor * zoom_factor, self.min_zoom), self.max_zoom)
+        # Get scroll bar values before zoom
+        h_val = self.horizontalScrollBar().value()
+        v_val = self.verticalScrollBar().value()
         
         # Update display
         self._update_display()
         
-        # Adjust scrollbars to maintain zoom center
-        new_scaled_size = self.current_pixmap.size() * self.zoom_factor
-        if new_scaled_size.width() > self.viewport().width():
-            new_x = int(old_ratio_x * (new_scaled_size.width() - self.viewport().width()))
-            self.horizontalScrollBar().setValue(new_x)
-        else:
-            self.horizontalScrollBar().setValue(0)
-            
-        if new_scaled_size.height() > self.viewport().height():
-            new_y = int(old_ratio_y * (new_scaled_size.height() - self.viewport().height()))
-            self.verticalScrollBar().setValue(new_y)
-        else:
-            self.verticalScrollBar().setValue(0)
+        # Adjust scroll to keep point under mouse
+        viewport_pos = self.viewport().mapFromGlobal(event.globalPos())
+        new_h = int((h_val + viewport_pos.x()) * zoom_ratio - viewport_pos.x())
+        new_v = int((v_val + viewport_pos.y()) * zoom_ratio - viewport_pos.y())
+        
+        self.horizontalScrollBar().setValue(new_h)
+        self.verticalScrollBar().setValue(new_v)
+        
+        event.accept()
     
     def mouseDoubleClickEvent(self, event):
-        """Handle double click to fit to view."""
-        self.fit_to_view()
+        """Toggle between fit and 100% zoom."""
+        if not self.current_pixmap:
+            return
+        
+        if self.fit_mode or self.zoom_factor < 0.99:
+            self.reset_zoom()
+        else:
+            self.fit_to_view()
+        
         self.double_clicked.emit()
     
     def clear(self):
@@ -450,6 +602,310 @@ class ImageDisplay(QScrollArea):
         self.image_label.clear()
         self.image_label.setText("No image loaded")
         self.current_pixmap = None
+        self.fit_mode = True
+
+
+class SegmentBar(QWidget):
+    """Multi-segment colored progress bar (kept/deleted/moved/pending)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(8)
+        self.setMinimumWidth(50)
+        self.segments: List[Tuple[float, QColor]] = []
+
+    def set_data(self, kept: int, deleted: int, moved: int, pending: int):
+        total = kept + deleted + moved + pending
+        self.segments = []
+        if total > 0:
+            self.segments = [
+                (kept / total, QColor("#22c55e")),
+                (deleted / total, QColor("#ef4444")),
+                (moved / total, QColor("#f59e0b")),
+                (pending / total, QColor("#3f4146")),
+            ]
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#2a2b2e"))
+        painter.drawRoundedRect(rect, 4, 4)
+
+        x = 0
+        for frac, color in self.segments:
+            if frac <= 0:
+                continue
+            w = round(rect.width() * frac)
+            painter.setBrush(color)
+            painter.drawRect(rect.x() + x, rect.y(), w, rect.height())
+            x += w
+
+
+class ClassCard(QFrame):
+    """Modern card widget for displaying a class with progress."""
+    
+    clicked = pyqtSignal(str)  # Emits class name
+    rename_requested = pyqtSignal(str)  # Emits class name
+    
+    def __init__(self, class_name: str, color: str, show_rename: bool = True, parent=None):
+        super().__init__(parent)
+        self.class_name = class_name
+        self.color = color
+        self.is_selected = False
+        self.show_rename = show_rename
+        
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(90)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setSpacing(6)
+        
+        # Header with class name and rename button
+        header = QHBoxLayout()
+        header.setSpacing(6)
+        self.name_label = QLabel(class_name)
+        self.name_label.setWordWrap(True)
+        self.name_label.setStyleSheet("""
+            font-size: 14px;
+            font-weight: 600;
+            color: #ececec;
+            background: transparent;
+        """)
+        header.addWidget(self.name_label, 1)
+        
+        if show_rename:
+            rename_btn = QPushButton("\u270f")
+            rename_btn.setFixedSize(24, 24)
+            rename_btn.setToolTip("Rename class")
+            rename_btn.setCursor(Qt.PointingHandCursor)
+            rename_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: transparent;
+                    border: none;
+                    font-size: 12px;
+                    color: #8a8a8a;
+                }
+                QPushButton:hover {
+                    color: #ffffff;
+                }
+            """)
+            rename_btn.clicked.connect(lambda: self.rename_requested.emit(self.class_name))
+            header.addWidget(rename_btn)
+        
+        layout.addLayout(header)
+        
+        # Stats label
+        self.stats_label = QLabel("0 images")
+        self.stats_label.setStyleSheet("color: #9a9a9a; font-size: 11px; background: transparent;")
+        layout.addWidget(self.stats_label)
+        
+        # Multi-segment progress bar
+        self.progress_bar = SegmentBar()
+        layout.addWidget(self.progress_bar)
+        
+        self._update_style()
+    
+    def mousePressEvent(self, event):
+        """Handle click."""
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.class_name)
+    
+    def set_selected(self, selected: bool):
+        """Set selection state."""
+        self.is_selected = selected
+        self._update_style()
+    
+    def update_stats(self, kept: int, deleted: int, moved: int, pending: int):
+        """Update statistics and progress bar."""
+        total = kept + deleted + moved + pending
+        self.stats_label.setText(f"{total} images")
+        self.progress_bar.set_data(kept, deleted, moved, pending)
+    
+    def _update_style(self):
+        """Update card styling based on state."""
+        if self.is_selected:
+            self.setStyleSheet(f"""
+                QFrame {{
+                    background-color: #24262a;
+                    border: 2px solid {self.color};
+                    border-radius: 8px;
+                }}
+            """)
+        else:
+            self.setStyleSheet("""
+                QFrame {
+                    background-color: #1e1f22;
+                    border: 2px solid transparent;
+                    border-radius: 8px;
+                }
+                QFrame:hover {
+                    background-color: #26282c;
+                }
+            """)
+
+
+class ClassListWidget(QWidget):
+    """Modern scrollable list of class cards."""
+    
+    class_selected = pyqtSignal(object)  # Emits class name or None for "All"
+    class_renamed = pyqtSignal(str, str)  # Emits (old_name, new_name)
+    
+    def __init__(self):
+        super().__init__()
+        self.cards = {}
+        self.colors = ["#0078d4", "#2d8a3e", "#c4314b", "#986f0b", "#7a3b9e", "#008272"]
+        self.selected_class = None
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Header
+        header = QLabel("Classes")
+        header.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: 600;
+                color: #fff;
+                padding: 16px;
+                background-color: #1a1a1a;
+            }
+        """)
+        layout.addWidget(header)
+        
+        # Scroll area for cards
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: #1a1a1a;
+            }
+        """)
+        
+        self.cards_container = QWidget()
+        self.cards_container.setStyleSheet("background-color: #1a1a1a;")
+        self.cards_layout = QVBoxLayout(self.cards_container)
+        self.cards_layout.setContentsMargins(8, 8, 8, 8)
+        self.cards_layout.setSpacing(8)
+        
+        # "All Classes" card (no rename button)
+        self.all_card = ClassCard("All Classes", "#9ca3af", show_rename=False)
+        self.all_card.clicked.connect(self._on_all_clicked)
+        self.cards_layout.addWidget(self.all_card)
+        
+        # Stretch to keep cards at top
+        self.cards_layout.addStretch()
+        
+        scroll.setWidget(self.cards_container)
+        layout.addWidget(scroll, 1)
+        
+        # Add class button
+        add_btn = QPushButton("+ New Class")
+        add_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 12px;
+                font-size: 13px;
+                font-weight: 600;
+                margin: 8px;
+            }
+            QPushButton:hover {
+                background-color: #1084d8;
+            }
+            QPushButton:pressed {
+                background-color: #0b6cb8;
+            }
+        """)
+        add_btn.clicked.connect(self._add_new_class)
+        layout.addWidget(add_btn)
+    
+    def set_classes(self, classes: List[str]):
+        """Set the list of classes."""
+        # Remove old class cards (keep index 0 = All Classes card, and stretch)
+        while self.cards_layout.count() > 2:
+            item = self.cards_layout.takeAt(1)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.cards.clear()
+        
+        # Create cards for each class
+        for idx, class_name in enumerate(classes):
+            color = self.colors[idx % len(self.colors)]
+            card = ClassCard(class_name, color)
+            card.clicked.connect(self._on_card_clicked)
+            card.rename_requested.connect(self._rename_class)
+            self.cards[class_name] = card
+            self.cards_layout.insertWidget(self.cards_layout.count() - 1, card)
+    
+    def _on_card_clicked(self, class_name: str):
+        """Handle class card selection."""
+        # Deselect all
+        self.all_card.set_selected(False)
+        for card in self.cards.values():
+            card.set_selected(False)
+        
+        # Select clicked card
+        if class_name in self.cards:
+            self.cards[class_name].set_selected(True)
+            self.selected_class = class_name
+            self.class_selected.emit(class_name)
+    
+    def _on_all_clicked(self, _name: str):
+        """Handle 'All Classes' card selection."""
+        self.all_card.set_selected(True)
+        for card in self.cards.values():
+            card.set_selected(False)
+        self.selected_class = None
+        self.class_selected.emit(None)
+    
+    def select_all(self):
+        """Deselect all cards (show all classes)."""
+        self.all_card.set_selected(True)
+        for card in self.cards.values():
+            card.set_selected(False)
+        self.selected_class = None
+        self.class_selected.emit(None)
+    
+    def update_class_stats(self, class_name: str, kept: int, deleted: int, moved: int, pending: int):
+        """Update statistics for a class card."""
+        if class_name in self.cards:
+            self.cards[class_name].update_stats(kept, deleted, moved, pending)
+    
+    def update_all_stats(self, kept: int, deleted: int, moved: int, pending: int):
+        """Update statistics for the 'All Classes' card."""
+        self.all_card.update_stats(kept, deleted, moved, pending)
+    
+    def _rename_class(self, old_name: str):
+        """Prompt to rename a class."""
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Rename Class",
+            f"Enter new name for '{old_name}':",
+            text=old_name
+        )
+        if ok and new_name and new_name != old_name:
+            self.class_renamed.emit(old_name, new_name)
+    
+    def _add_new_class(self):
+        """Add a new class."""
+        name, ok = QInputDialog.getText(
+            self,
+            "New Class",
+            "Enter name for new class:"
+        )
+        if ok and name:
+            # Emit rename with empty old name to signal "add"
+            self.class_renamed.emit("", name)
 
 
 class ClassSelectionDialog(QDialog):
@@ -636,12 +1092,23 @@ class ImageProcessorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Image Classification Processor")
-        self.setMinimumSize(1200, 800)
-        self.resize(1400, 900)
+        self.setMinimumSize(1280, 820)
+        self.resize(1500, 950)
         
         self.state = ProcessingState()
         self.session_file = Path("image_processor_session.json")
         self.current_filter_class = None  # None means "All Classes"
+        self.setAcceptDrops(True)
+        
+        # --- Gamification state (session-scoped) ---
+        self.game_log: List[str] = []          # parallel to history: keep/delete/move
+        self.streak: int = 0                    # consecutive keeps
+        self.best_streak: int = 0
+        self.score: int = 0
+        self.kept_total: int = 0
+        self.deleted_total: int = 0
+        self.moved_total: int = 0
+        self.achievements: set = set()
         
         self._setup_ui()
         self._setup_shortcuts()
@@ -651,258 +1118,190 @@ class ImageProcessorWindow(QMainWindow):
         """Set up the main UI layout."""
         # Central widget
         central = QWidget()
+        central.setStyleSheet("background: #161719;")
         self.setCentralWidget(central)
-        
-        main_layout = QHBoxLayout(central)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
-        
-        # Create splitter for resizable panels
-        splitter = QSplitter(Qt.Horizontal)
-        main_layout.addWidget(splitter)
-        
-        # === Left Panel: Controls & Info ===
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        left_layout.setSpacing(10)
-        
-        # Drop area for folder selection
-        self.drop_area = DropArea()
-        left_layout.addWidget(self.drop_area)
-        self.drop_area.folder_dropped.connect(self._load_folder)
-        
-        # Browse button
-        browse_btn = QPushButton("📁 Browse for Folder")
-        browse_btn.setStyleSheet("""
-            QPushButton {
-                padding: 10px;
-                font-size: 14px;
-                background-color: #0078d4;
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #1084d8;
-            }
-            QPushButton:pressed {
-                background-color: #0b6cb8;
-            }
-        """)
-        browse_btn.clicked.connect(self._browse_folder)
-        left_layout.addWidget(browse_btn)
-        
-        # Stats frame
-        stats_frame = QFrame()
-        stats_frame.setStyleSheet("""
-            QFrame {
-                background-color: #2d2d2d;
-                border: 1px solid #444;
-                border-radius: 5px;
-                padding: 10px;
-            }
-        """)
-        stats_layout = QVBoxLayout(stats_frame)
-        
-        self.stats_label = QLabel("Statistics:\nPending: 0\nKept: 0\nDeleted: 0\nMoved: 0")
-        self.stats_label.setStyleSheet("color: #ccc; font-size: 12px;")
-        stats_layout.addWidget(self.stats_label)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #444;
-                border-radius: 3px;
-                text-align: center;
-                color: white;
-            }
-            QProgressBar::chunk {
-                background-color: #0078d4;
-            }
-        """)
-        stats_layout.addWidget(self.progress_bar)
-        
-        left_layout.addWidget(stats_frame)
-        
-        # Keyboard shortcuts info
-        shortcuts_label = QLabel(
-            "Keyboard Shortcuts:\n"
-            "A / D - Previous / Next image\n"
-            "Enter - Keep image\n"
-            "X - Delete image\n"
-            "C - Change class\n"
-            "Ctrl+Z - Undo\n"
-            "F - Fit to view\n"
-            "+ / - - Zoom in/out\n"
-            "0 - Reset zoom"
-        )
-        shortcuts_label.setStyleSheet("""
-            color: #888;
-            font-size: 11px;
-            background-color: #252525;
-            padding: 10px;
-            border-radius: 5px;
-        """)
-        left_layout.addWidget(shortcuts_label)
-        
-        # Apply changes button
-        self.apply_btn = QPushButton("✅ Apply Changes & Export")
-        self.apply_btn.setEnabled(False)
-        self.apply_btn.setStyleSheet("""
-            QPushButton {
-                padding: 12px;
-                font-size: 14px;
-                font-weight: bold;
-                background-color: #2d8a3e;
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #34a049;
-            }
-            QPushButton:disabled {
-                background-color: #444;
-                color: #666;
-            }
-        """)
-        self.apply_btn.clicked.connect(self._apply_changes)
-        left_layout.addWidget(self.apply_btn)
-        
-        left_layout.addStretch()
-        splitter.addWidget(left_panel)
-        
+
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # === Left Panel: Class cards ===
+        self.class_list = ClassListWidget()
+        self.class_list.setFixedWidth(300)
+        self.class_list.class_selected.connect(self._on_class_selected)
+        self.class_list.class_renamed.connect(self._on_class_renamed)
+        root.addWidget(self.class_list)
+
         # === Center Panel: Image Display ===
         center_panel = QWidget()
         center_layout = QVBoxLayout(center_panel)
         center_layout.setContentsMargins(0, 0, 0, 0)
-        center_layout.setSpacing(5)
-        
-        # Class filter and info bar (prominent class display)
-        self.class_filter_combo = QComboBox()
-        self.class_filter_combo.setStyleSheet("""
-            QComboBox {
-                padding: 8px 12px;
-                font-size: 14px;
-                background-color: #333;
-                color: white;
-                border: 1px solid #555;
-                border-radius: 5px;
+        center_layout.setSpacing(0)
+
+        # Top bar: open folder, class badge, info, export
+        top_bar = QWidget()
+        top_bar.setStyleSheet("background: #1e1f22;")
+        top_lay = QHBoxLayout(top_bar)
+        top_lay.setContentsMargins(14, 10, 14, 10)
+        top_lay.setSpacing(10)
+
+        open_btn = QPushButton("\U0001f4c2 Open Folder")
+        open_btn.setCursor(Qt.PointingHandCursor)
+        open_btn.setStyleSheet("""
+            QPushButton {
+                background: #2c2e32; color: #ececec; border: none; border-radius: 6px;
+                padding: 9px 16px; font-size: 13px; font-weight: 600;
             }
-            QComboBox::drop-down {
-                border: none;
-            }
-            QComboBox::down-arrow {
-                image: none;
-                border-left: 5px solid transparent;
-                border-right: 5px solid transparent;
-                border-top: 5px solid #888;
-            }
+            QPushButton:hover { background: #383b40; }
         """)
-        self.class_filter_combo.addItem("All Classes")
-        self.class_filter_combo.currentIndexChanged.connect(self._on_class_filter_changed)
-        
+        open_btn.clicked.connect(self._browse_folder)
+        top_lay.addWidget(open_btn)
+
         # Class badge (large, prominent display)
-        self.class_badge = QLabel("NO CLASS")
+        self.class_badge = QLabel("No class")
+        self.class_badge.setAlignment(Qt.AlignCenter)
+        self.class_badge.setMinimumWidth(150)
         self.class_badge.setStyleSheet("""
             QLabel {
-                background-color: #0078d4;
-                color: white;
-                font-size: 18px;
-                font-weight: bold;
-                padding: 10px 20px;
-                border-radius: 8px;
-                min-width: 120px;
+                background-color: #3b82f6; color: white; border-radius: 10px;
+                padding: 8px 18px; font-size: 16px; font-weight: 700;
             }
         """)
-        self.class_badge.setAlignment(Qt.AlignCenter)
-        
-        # Image info label (smaller, below class)
-        self.info_label = QLabel("No image loaded")
-        self.info_label.setStyleSheet("""
-            color: #aaa;
-            font-size: 12px;
-            padding: 6px;
-            background-color: #252525;
-            border-radius: 3px;
+        top_lay.addWidget(self.class_badge)
+
+        # Image info label
+        self.info_label = QLabel("Open a folder to begin")
+        self.info_label.setStyleSheet("color: #a5a5a5; font-size: 12px;")
+        top_lay.addWidget(self.info_label, 1)
+
+        export_btn = QPushButton("\u2714 Export")
+        export_btn.setCursor(Qt.PointingHandCursor)
+        export_btn.setStyleSheet("""
+            QPushButton {
+                background: #22c55e; color: white; border: none; border-radius: 6px;
+                padding: 9px 18px; font-size: 13px; font-weight: 700;
+            }
+            QPushButton:hover { background: #16a34a; }
         """)
-        
-        # Top bar with filter and class display
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(self.class_filter_combo)
-        top_bar.addWidget(self.class_badge)
-        top_bar.addWidget(self.info_label)
-        top_bar.setSpacing(10)
-        center_layout.addLayout(top_bar)
-        
+        export_btn.clicked.connect(self._apply_changes)
+        top_lay.addWidget(export_btn)
+
+        center_layout.addWidget(top_bar)
+
         # Image display
         self.image_display = ImageDisplay()
-        center_layout.addWidget(self.image_display)
-        
-        # Navigation buttons
-        nav_layout = QHBoxLayout()
-        
-        self.prev_btn = QPushButton("◀ Previous (A)")
-        self.prev_btn.setStyleSheet("""
-            QPushButton {
-                padding: 10px 20px;
-                font-size: 13px;
-                background-color: #444;
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
+        center_layout.addWidget(self.image_display, 1)
+
+        # Bottom action bar
+        bottom_bar = QWidget()
+        bottom_bar.setStyleSheet("background: #1e1f22;")
+        bottom_lay = QHBoxLayout(bottom_bar)
+        bottom_lay.setContentsMargins(14, 10, 14, 10)
+        bottom_lay.setSpacing(8)
+
+        def style_btn(color: str, hover: str):
+            return (f"""
+                QPushButton {{
+                    background: {color}; color: white; border: none; border-radius: 6px;
+                    padding: 9px 18px; font-size: 13px; font-weight: 600;
+                }}
+                QPushButton:hover {{ background: {hover}; }}
+            """)
+
+        self.prev_btn = QPushButton("\u25c0 Previous (A)")
+        self.prev_btn.setCursor(Qt.PointingHandCursor)
+        self.prev_btn.setStyleSheet(style_btn("#3a3d42", "#4a4e55"))
         self.prev_btn.clicked.connect(self._previous_image)
-        nav_layout.addWidget(self.prev_btn)
-        
-        nav_layout.addStretch()
-        
-        self.next_btn = QPushButton("Next (D) ▶")
-        self.next_btn.setStyleSheet("""
-            QPushButton {
-                padding: 10px 20px;
-                font-size: 13px;
-                background-color: #444;
-                color: white;
-                border: none;
-                border-radius: 5px;
-            }
-            QPushButton:hover {
-                background-color: #555;
-            }
-        """)
+        bottom_lay.addWidget(self.prev_btn)
+
+        keep_btn = QPushButton("\u2714 Keep (Enter)")
+        keep_btn.setCursor(Qt.PointingHandCursor)
+        keep_btn.setStyleSheet(style_btn("#22c55e", "#16a34a"))
+        keep_btn.clicked.connect(self._keep_image)
+        bottom_lay.addWidget(keep_btn)
+
+        delete_btn = QPushButton("\u2715 Delete (X)")
+        delete_btn.setCursor(Qt.PointingHandCursor)
+        delete_btn.setStyleSheet(style_btn("#ef4444", "#dc2626"))
+        delete_btn.clicked.connect(self._delete_image)
+        bottom_lay.addWidget(delete_btn)
+
+        move_btn = QPushButton("\u2192 Move (C)")
+        move_btn.setCursor(Qt.PointingHandCursor)
+        move_btn.setStyleSheet(style_btn("#f59e0b", "#d97706"))
+        move_btn.clicked.connect(self._change_class)
+        bottom_lay.addWidget(move_btn)
+
+        undo_btn = QPushButton("\u21b6 Undo (Ctrl+Z)")
+        undo_btn.setCursor(Qt.PointingHandCursor)
+        undo_btn.setStyleSheet(style_btn("#3a3d42", "#4a4e55"))
+        undo_btn.clicked.connect(self._undo)
+        bottom_lay.addWidget(undo_btn)
+
+        self.next_btn = QPushButton("Next (D) \u25b6")
+        self.next_btn.setCursor(Qt.PointingHandCursor)
+        self.next_btn.setStyleSheet(style_btn("#3a3d42", "#4a4e55"))
         self.next_btn.clicked.connect(self._next_image)
-        nav_layout.addWidget(self.next_btn)
-        
-        center_layout.addLayout(nav_layout)
-        splitter.addWidget(center_panel)
-        
+        bottom_lay.addWidget(self.next_btn)
+
+        center_layout.addWidget(bottom_bar)
+
+        # --- Gamification strip (slim, below action bar) ---
+        game_bar = QWidget()
+        game_bar.setStyleSheet("background: #161719;")
+        game_lay = QHBoxLayout(game_bar)
+        game_lay.setContentsMargins(16, 4, 16, 6)
+        game_lay.setSpacing(18)
+
+        self.streak_label = QLabel("\U0001f525 Streak: 0")
+        self.streak_label.setStyleSheet("color: #fb923c; font-size: 13px; font-weight: 700;")
+        game_lay.addWidget(self.streak_label)
+
+        self.best_label = QLabel("\U0001f3c6 Best: 0")
+        self.best_label.setStyleSheet("color: #fbbf24; font-size: 12px; font-weight: 600;")
+        game_lay.addWidget(self.best_label)
+
+        self.acc_label = QLabel("\U0001f4ca Model ACC: --")
+        self.acc_label.setStyleSheet("color: #4ade80; font-size: 12px; font-weight: 600;")
+        game_lay.addWidget(self.acc_label)
+
+        self.score_label = QLabel("\U0001f3af Score: 0")
+        self.score_label.setStyleSheet("color: #38bdf8; font-size: 12px; font-weight: 600;")
+        game_lay.addWidget(self.score_label)
+
+        self.level_label = QLabel("\U0001f396\ufe0f Data Tagger")
+        self.level_label.setStyleSheet("color: #c084fc; font-size: 12px; font-weight: 600;")
+        game_lay.addWidget(self.level_label)
+
+        game_lay.addStretch()
+        center_layout.addWidget(game_bar)
+
+        root.addWidget(center_panel, 1)
+
         # === Right Panel: History Log ===
         right_panel = QWidget()
+        right_panel.setFixedWidth(260)
+        right_panel.setStyleSheet("background: #1a1b1e;")
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        
+        right_layout.setSpacing(0)
+
         history_label = QLabel("Action History")
-        history_label.setStyleSheet("color: #ccc; font-size: 14px; font-weight: bold;")
+        history_label.setStyleSheet("""
+            color: #ffffff; font-size: 15px; font-weight: 700;
+            padding: 14px 16px; background: #1a1b1e;
+        """)
         right_layout.addWidget(history_label)
-        
+
         self.history_list = HistoryListWidget()
         right_layout.addWidget(self.history_list)
-        
-        splitter.addWidget(right_panel)
-        
-        # Set splitter sizes (left: 200, center: 600, right: 200)
-        splitter.setSizes([250, 700, 250])
-        
+
+        root.addWidget(right_panel)
+
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage("Ready - Drag & drop a folder to begin")
+        self.status_bar.showMessage("Ready - Drop a folder or click 'Open Folder'")
     
     def _setup_shortcuts(self):
         """Set up keyboard shortcuts."""
@@ -955,6 +1354,19 @@ class ImageProcessorWindow(QMainWindow):
         if folder:
             self._load_folder(Path(folder))
     
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """Accept folder drag & drop."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+    
+    def dropEvent(self, event: QDropEvent):
+        """Load folder dropped on the window."""
+        for url in event.mimeData().urls():
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                self._load_folder(path)
+                return
+    
     def _load_folder(self, folder_path: Path):
         """Load images from the selected folder."""
         self.status_bar.showMessage(f"Loading images from {folder_path.name}...")
@@ -969,34 +1381,59 @@ class ImageProcessorWindow(QMainWindow):
             self.status_bar.showMessage("No images found")
             return
         
-        # Populate class filter dropdown
-        self.class_filter_combo.blockSignals(True)
-        self.class_filter_combo.clear()
-        self.class_filter_combo.addItem("All Classes")
-        for cls in sorted(self.state.classes):
-            self.class_filter_combo.addItem(cls)
-        self.class_filter_combo.blockSignals(False)
         self.current_filter_class = None
+        self.class_list.set_classes(self.state.classes)
+        self.class_list.select_all()
         
         self._update_ui()
         self._display_current_image()
-        self.apply_btn.setEnabled(True)
         
         self.status_bar.showMessage(
             f"Loaded {len(self.state.images)} images from {len(self.state.classes)} classes"
         )
     
-    def _on_class_filter_changed(self, index: int):
-        """Handle class filter change - update view to show only selected class images."""
-        if index == 0:
-            self.current_filter_class = None  # All classes
-        else:
-            self.current_filter_class = self.class_filter_combo.itemText(index)
-        
-        # Find first pending image in the filtered set
+    def _on_class_selected(self, class_name: str):
+        """Handle class card selection. class_name is a class or None for 'All'."""
+        self.current_filter_class = class_name
         self._go_to_first_pending()
         self._update_stats()
         self._display_current_image()
+    
+    def _on_class_renamed(self, old_name: str, new_name: str):
+        """Handle rename ('') or creation (old_name empty) of a class."""
+        if not new_name:
+            return
+        
+        if old_name == "":
+            # New class creation
+            if self.state.add_class(new_name):
+                self.class_list.set_classes(self.state.classes)
+                self._refresh_card_stats()
+                self.status_bar.showMessage(f"Created class '{new_name}'", 3000)
+            else:
+                QMessageBox.warning(self, "Error", f"Could not create class '{new_name}'.")
+            return
+        
+        # Rename existing class
+        if self.state.rename_class(old_name, new_name):
+            self.class_list.set_classes(self.state.classes)
+            if self.current_filter_class == old_name:
+                self.current_filter_class = new_name
+            self._refresh_card_stats()
+            self._display_current_image()
+            self.status_bar.showMessage(f"Renamed '{old_name}' to '{new_name}'", 3000)
+        else:
+            QMessageBox.warning(self, "Error",
+                f"Could not rename '{old_name}' to '{new_name}'.\n"
+                "A class with that name may already exist.")
+    
+    def _refresh_card_stats(self):
+        """Update stats on every class card."""
+        for cls in self.state.classes:
+            s = self.state.get_class_stats(cls)
+            self.class_list.update_class_stats(cls, s["kept"], s["deleted"], s["moved"], s["pending"])
+        total = self.state.get_class_stats(None)
+        self.class_list.update_all_stats(total["kept"], total["deleted"], total["moved"], total["pending"])
     
     def _go_to_first_pending(self):
         """Navigate to first pending image in the current filter."""
@@ -1062,8 +1499,8 @@ class ImageProcessorWindow(QMainWindow):
     def _update_stats(self):
         """Update statistics display (respecting class filter)."""
         self.state.update_stats()
+        self._refresh_card_stats()
         
-        # Get filtered images for stats display
         if self.current_filter_class:
             filtered_imgs = [img for img in self.state.images if img.class_name == self.current_filter_class]
             total = len(filtered_imgs)
@@ -1080,21 +1517,6 @@ class ImageProcessorWindow(QMainWindow):
             moved = self.state.stats.get("moved", 0)
             filter_suffix = " (All)"
         
-        self.stats_label.setText(
-            f"Statistics{filter_suffix}:\n"
-            f"Pending: {pending}\n"
-            f"Kept: {kept}\n"
-            f"Deleted: {deleted}\n"
-            f"Moved: {moved}"
-        )
-        
-        if total > 0:
-            processed = total - pending
-            self.progress_bar.setMaximum(total)
-            self.progress_bar.setValue(processed)
-            self.progress_bar.setFormat(f"{processed}/{total} ({processed*100//total}%)")
-        
-        self._update_class_badge()
         self.info_label.setText(self._get_info_text())
     
     def _get_info_text(self) -> str:
@@ -1122,9 +1544,11 @@ class ImageProcessorWindow(QMainWindow):
                 # Auto-fit on load
                 QTimer.singleShot(100, self.image_display.fit_to_view)
             self.info_label.setText(self._get_info_text())
+            self._update_class_badge()
         else:
             self.image_display.clear()
             self.info_label.setText("No image loaded")
+            self._update_class_badge()
     
     def _previous_image(self):
         """Go to previous image (respecting class filter)."""
@@ -1166,15 +1590,21 @@ class ImageProcessorWindow(QMainWindow):
         """Mark current image as kept."""
         if self.state.keep_image():
             self.history_list.add_history_entry(self.state.history[-1])
+            self.game_log.append("keep")
+            self._record_action("keep")
             self._update_stats()
             self._auto_advance()
+            self._save_session()
     
     def _delete_image(self):
         """Mark current image for deletion."""
         if self.state.delete_image():
             self.history_list.add_history_entry(self.state.history[-1])
+            self.game_log.append("delete")
+            self._record_action("delete")
             self._update_stats()
             self._auto_advance()
+            self._save_session()
     
     def _change_class(self):
         """Open dialog to change image class."""
@@ -1186,21 +1616,156 @@ class ImageProcessorWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted and dialog.selected_class:
             if self.state.move_image(dialog.selected_class):
                 self.history_list.add_history_entry(self.state.history[-1])
+                self.game_log.append("move")
+                self._record_action("move")
                 self._update_stats()
                 self._auto_advance()
+                self._save_session()
     
     def _auto_advance(self):
-        """Automatically advance to next pending image."""
-        # Find next pending image
-        next_idx = self.state.get_next_pending_index(self.state.current_index + 1)
-        if next_idx >= 0:
-            self.state.current_index = next_idx
-            self._display_current_image()
-            self._update_stats()
+        """Automatically advance to next pending image (respecting class filter)."""
+        cls = self.current_filter_class
+        start = self.state.current_index + 1
+        # Look forward
+        for i in range(start, len(self.state.images)):
+            img = self.state.images[i]
+            if img.status == "pending" and (cls is None or img.class_name == cls):
+                self.state.current_index = i
+                self._display_current_image()
+                self._update_stats()
+                return
+        # Look backward
+        for i in range(0, start):
+            img = self.state.images[i]
+            if img.status == "pending" and (cls is None or img.class_name == cls):
+                self.state.current_index = i
+                self._display_current_image()
+                self._update_stats()
+                return
+        msg = "All images processed!"
+        if cls:
+            msg = f"All images in '{cls}' processed!"
+        self.status_bar.showMessage(msg, 4000)
+    
+    # ===================================================== GAMIFICATION
+    _LEVELS = [
+        (0,   "Data Tagger"),
+        (10,  "Label Lord"),
+        (25,  "Annotation Ace"),
+        (50,  "Curator"),
+        (100, "Dataset Sage"),
+        (200, "Label Legend"),
+        (400, "ML Zen Master"),
+    ]
+
+    _STREAK_MILESTONES = [5, 10, 25, 50, 100]
+    _ACC_BADGES = [60, 75, 85, 90, 95, 99]
+
+    def _level_for(self, total: int) -> Tuple[int, str]:
+        """Return (level_index, title) for a given number of decisions."""
+        for i in range(len(self._LEVELS) - 1, -1, -1):
+            if total >= self._LEVELS[i][0]:
+                return i, self._LEVELS[i][1]
+        return 0, self._LEVELS[0][1]
+
+    def _record_action(self, action: str):
+        """Update streak/score/totals for an action, with milestone toasts."""
+        changed = False
+        if action == "keep":
+            self.kept_total += 1
+            self.streak += 1
+            if self.streak > self.best_streak:
+                self.best_streak = self.streak
+                changed = True
+            self.score += 10
+            # streak moment
+            if self.streak in self._STREAK_MILESTONES:
+                self.status_bar.showMessage(
+                    f"\U0001f525 {self.streak} keeps in a row! Model's on fire!", 3500)
+            if self.best_streak in self._STREAK_MILESTONES and "best_streak" not in self.achievements:
+                self.achievements.add("best_streak")
+                self.status_bar.showMessage(f"\U0001f3c6 New best streak: {self.best_streak}!", 3500)
+        elif action == "delete":
+            self.deleted_total += 1
+            self.streak = 0
+            self.score += 2
+        elif action == "move":
+            self.moved_total += 1
+            self.streak = 0
+            self.score += 5
+
+        # model accuracy badge (kept / processed)
+        processed = self.kept_total + self.deleted_total + self.moved_total
+        if processed >= 10:
+            acc = self.kept_total / processed * 100
+            for thresh in self._ACC_BADGES:
+                if acc >= thresh and f"acc{thresh}" not in self.achievements:
+                    self.achievements.add(f"acc{thresh}")
+                    self.status_bar.showMessage(
+                        f"\U0001f4ca Model accuracy reached {thresh:g}%! "
+                        f"({acc:.1f}% current)", 3500)
+                    changed = True
+
+        # level-ups
+        total = self.kept_total + self.deleted_total + self.moved_total
+        new_idx, new_title = self._level_for(total)
+        old_idx = self._game_level_idx if hasattr(self, "_game_level_idx") else 0
+        if new_idx > old_idx:
+            self.status_bar.showMessage(
+                f"\U0001f396\ufe0f Level up! You are now a {new_title}!", 3500)
+            changed = True
+        self._game_level_idx = new_idx
+        self._game_prev_total = total
+
+        self._update_gamification()
+        return changed
+
+    def _unrecord_action(self, action: str):
+        """Reverse an action's gamification effects (used by Undo)."""
+        if action == "keep":
+            self.kept_total = max(0, self.kept_total - 1)
+            self.streak = max(0, self.streak - 1)
+            self.score = max(0, self.score - 10)
+        elif action == "delete":
+            self.deleted_total = max(0, self.deleted_total - 1)
+            self.score = max(0, self.score - 2)
+        elif action == "move":
+            self.moved_total = max(0, self.moved_total - 1)
+            self.score = max(0, self.score - 5)
+
+        total = self.kept_total + self.deleted_total + self.moved_total
+        new_idx, new_title = self._level_for(total)
+        if new_idx < self._game_level_idx:
+            self.status_bar.showMessage(f"\U0001f396\ufe0f Down a level... no shame in it.", 2500)
+        self._game_level_idx = new_idx
+        self._update_gamification()
+
+    def _update_gamification(self):
+        """Refresh the gamification strip."""
+        processed = self.kept_total + self.deleted_total + self.moved_total
+        acc = (self.kept_total / processed * 100) if processed else None
+
+        self.streak_label.setText(f"\U0001f525 Streak: {self.streak}")
+        self.best_label.setText(f"\U0001f3c6 Best: {self.best_streak}")
+        self.score_label.setText(f"\U0001f3af Score: {self.score}")
+
+        level_idx, level_title = self._level_for(processed)
+        self.level_label.setText(f"\U0001f396\ufe0f {level_title}")
+
+        if acc is None:
+            self.acc_label.setText("\U0001f4ca Model ACC: --")
+        else:
+            color = "#22c55e" if acc >= 85 else ("#eab308" if acc >= 60 else "#ef4444")
+            self.acc_label.setText(f"\U0001f4ca Model ACC: {acc:.1f}%")
+            self.acc_label.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
     
     def _undo(self):
         """Undo the last action."""
         if self.state.undo_last():
+            # Reverse gamification for the undone action
+            if self.game_log:
+                act = self.game_log.pop()
+                self._unrecord_action(act)
             self._update_stats()
             self._display_current_image()
             # Update history list
@@ -1218,9 +1783,27 @@ class ImageProcessorWindow(QMainWindow):
     def _load_session(self):
         """Load session from file."""
         if self.state.load_progress(self.session_file):
+            self.current_filter_class = None
+            self.class_list.set_classes(self.state.classes)
+            self.class_list.select_all()
+            
+            # Rebuild gamification state from restored history
+            self.streak = 0
+            self.best_streak = 0
+            self.score = 0
+            self.kept_total = 0
+            self.deleted_total = 0
+            self.moved_total = 0
+            self.game_log = []
+            self.achievements = set()
+            self._game_level_idx = 0
+            for entry in self.state.history:
+                act = {"keep": "keep", "delete": "delete", "move": "move"}.get(entry.action, "keep")
+                self.game_log.append(act)
+                self._record_action(act)
+            
             self._update_ui()
             self._display_current_image()
-            self.apply_btn.setEnabled(True)
             
             # Populate history list
             self.history_list.clear()
